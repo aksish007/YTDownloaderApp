@@ -1,4 +1,3 @@
-const ytdl = require('@distube/ytdl-core');
 const { YtDlp } = require('ytdlp-nodejs');
 
 /**
@@ -28,7 +27,8 @@ function isValidYouTubeUrl(url) {
 }
 
 /**
- * Get video information and available formats
+ * Get video information and available formats using yt-dlp
+ * yt-dlp handles YouTube's anti-bot measures better than ytdl-core
  */
 async function getVideoInfo(url) {
   try {
@@ -37,72 +37,87 @@ async function getVideoInfo(url) {
       throw new Error('Invalid YouTube URL');
     }
 
-    // Configure ytdl with options to avoid 403 errors
-    const info = await ytdl.getInfo(url, {
-      requestOptions: {
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-        }
-      }
+    const ytdlp = new YtDlp();
+    
+    // Use yt-dlp to get video info with anti-bot bypass options
+    // yt-dlp handles bot detection automatically, but we can add extra options
+    const info = await ytdlp.getInfoAsync(url, {
+      // yt-dlp options (passed as object keys, not --flags)
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      referer: 'https://www.youtube.com/',
+      // Use Android client to bypass bot detection (more reliable)
+      // extractorArgs expects arrays of strings
+      extractorArgs: {
+        youtube: ['player_client=android']
+      },
     });
     
-    // Extract video details
+    // Extract video details from yt-dlp format
     const videoDetails = {
-      id: info.videoDetails.videoId,
-      title: info.videoDetails.title,
-      thumbnail: info.videoDetails.thumbnails[info.videoDetails.thumbnails.length - 1]?.url,
-      duration: info.videoDetails.lengthSeconds,
+      id: info.id || videoId,
+      title: info.title || 'Unknown Title',
+      thumbnail: info.thumbnail || (info.thumbnails && info.thumbnails[info.thumbnails.length - 1]?.url) || '',
+      duration: info.duration || 0,
       formats: []
     };
 
-    // Process available formats
-    const formats = info.formats.filter(format => 
-      format.hasVideo || format.hasAudio
-    );
-
-    // Deduplicate by itag first
-    const seenItags = new Set();
-    const uniqueFormats = formats.filter(format => {
-      if (seenItags.has(format.itag)) {
-        return false;
-      }
-      seenItags.add(format.itag);
-      return true;
-    });
-
-    // Group and categorize formats
+    // Process available formats from yt-dlp
+    const formats = info.formats || [];
+    
+    // Filter and process formats
     const videoFormats = [];
     const audioFormats = [];
-    const qualityMap = new Map(); // Track quality labels to avoid exact duplicates
+    const qualityMap = new Map();
+    const seenFormatIds = new Set();
 
-    uniqueFormats.forEach((format) => {
+    formats.forEach((format) => {
+      // Skip if we've already seen this format_id
+      const formatId = format.format_id || format.formatId;
+      if (seenFormatIds.has(formatId)) {
+        return;
+      }
+      seenFormatIds.add(formatId);
+
+      // Determine if it's video, audio, or both
+      const hasVideo = format.vcodec && format.vcodec !== 'none';
+      const hasAudio = format.acodec && format.acodec !== 'none';
+      
+      if (!hasVideo && !hasAudio) {
+        return; // Skip formats with neither
+      }
+
+      // Extract quality information
+      const quality = format.height || format.resolution || format.quality || 'Unknown';
+      const container = format.ext || format.container || 'mp4';
+      const bitrate = format.tbr || format.abr || format.vbr || 0;
+      const filesize = format.filesize || format.filesize_approx || 0;
+      
+      // Map format_id to itag for compatibility
+      const itag = parseInt(formatId) || format.itag || formatId;
+
       const formatInfo = {
-        itag: format.itag,
-        quality: format.qualityLabel || format.audioQuality || 'Unknown',
-        container: format.container,
-        hasVideo: format.hasVideo,
-        hasAudio: format.hasAudio,
-        videoCodec: format.videoCodec,
-        audioCodec: format.audioCodec,
-        bitrate: format.bitrate,
-        contentLength: format.contentLength,
+        itag: itag,
+        formatId: formatId,
+        quality: quality.toString(),
+        container: container,
+        hasVideo: hasVideo,
+        hasAudio: hasAudio,
+        videoCodec: format.vcodec,
+        audioCodec: format.acodec,
+        bitrate: bitrate,
+        contentLength: filesize,
         url: format.url,
-        mimeType: format.mimeType
+        mimeType: format.mimeType || `${hasVideo ? 'video' : 'audio'}/${container}`
       };
 
-      if (format.hasVideo && format.hasAudio) {
+      if (hasVideo && hasAudio) {
         // Video with audio
-        const qualityLabel = format.qualityLabel || 'Unknown';
-        const container = format.container || 'mp4';
-        const label = `${qualityLabel} (${container})`;
-        
-        // Create a unique key for this quality+container combination
+        const qualityLabel = quality.toString();
         const qualityKey = `${qualityLabel}-${container}`;
+        const label = `${qualityLabel}p (${container})`;
         
-        // Only add if we haven't seen this exact quality+container combo, or if this one has better bitrate
-        if (!qualityMap.has(qualityKey) || (format.bitrate && format.bitrate > (qualityMap.get(qualityKey)?.bitrate || 0))) {
+        if (!qualityMap.has(qualityKey) || (bitrate && bitrate > (qualityMap.get(qualityKey)?.bitrate || 0))) {
           if (qualityMap.has(qualityKey)) {
-            // Replace with better quality version
             const existingIndex = videoFormats.findIndex(f => `${f.quality}-${f.container}` === qualityKey);
             if (existingIndex !== -1) {
               videoFormats[existingIndex] = {
@@ -121,10 +136,9 @@ async function getVideoInfo(url) {
             qualityMap.set(qualityKey, formatInfo);
           }
         }
-      } else if (format.hasAudio && !format.hasVideo) {
-        // Audio only - show all unique audio formats
-        const audioQuality = format.audioQuality || 'Audio';
-        const container = format.container || 'm4a';
+      } else if (hasAudio && !hasVideo) {
+        // Audio only
+        const audioQuality = format.abr ? `${format.abr}kbps` : (format.quality || 'Audio');
         const label = `${audioQuality} (${container})`;
         
         audioFormats.push({
@@ -167,12 +181,18 @@ async function getDownloadStream(url, formatId) {
     const https = require('https');
     const http = require('http');
     
-    // Get the download URL using yt-dlp
-    // Format selector: use itag directly or format code
+    // Get the download URL using yt-dlp with anti-bot bypass options
     const formatSelector = formatId.toString();
     
     const info = await ytdlp.getInfoAsync(url, {
       format: formatSelector,
+      // Anti-bot bypass options
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      referer: 'https://www.youtube.com/',
+      // Use Android client to bypass bot detection (more reliable)
+      extractorArgs: {
+        youtube: ['player_client=android']
+      },
     });
 
     // Extract the download URL from the info
@@ -180,7 +200,12 @@ async function getDownloadStream(url, formatId) {
     
     // If url is not directly available, try to get it from formats
     if (!downloadUrl && info.formats) {
-      const format = info.formats.find(f => f.format_id === formatSelector || f.itag === formatId);
+      const format = info.formats.find(f => 
+        f.format_id === formatSelector || 
+        f.formatId === formatSelector ||
+        f.itag === formatId ||
+        parseInt(f.format_id) === parseInt(formatId)
+      );
       if (format) {
         downloadUrl = format.url;
       }
@@ -190,7 +215,7 @@ async function getDownloadStream(url, formatId) {
       throw new Error('No download URL available for the selected format');
     }
 
-    // Create a stream from the download URL
+    // Create a stream from the download URL with realistic browser headers
     const urlObj = new URL(downloadUrl);
     const client = urlObj.protocol === 'https:' ? https : http;
 
@@ -200,8 +225,13 @@ async function getDownloadStream(url, formatId) {
           'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
           'Accept': '*/*',
           'Accept-Language': 'en-US,en;q=0.9',
+          'Accept-Encoding': 'gzip, deflate, br',
           'Referer': 'https://www.youtube.com/',
           'Origin': 'https://www.youtube.com',
+          'Sec-Fetch-Dest': 'empty',
+          'Sec-Fetch-Mode': 'cors',
+          'Sec-Fetch-Site': 'cross-site',
+          'Connection': 'keep-alive',
         }
       }, (response) => {
         if (response.statusCode !== 200) {
