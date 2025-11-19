@@ -29,28 +29,41 @@ function isValidYouTubeUrl(url) {
 /**
  * Get video information and available formats using yt-dlp
  * yt-dlp handles YouTube's anti-bot measures better than ytdl-core
+ * Includes retry logic with different player clients
  */
 async function getVideoInfo(url) {
-  try {
-    const videoId = extractVideoId(url);
-    if (!videoId) {
-      throw new Error('Invalid YouTube URL');
-    }
+  const videoId = extractVideoId(url);
+  if (!videoId) {
+    throw new Error('Invalid YouTube URL');
+  }
 
-    const ytdlp = new YtDlp();
-    
-    // Use yt-dlp to get video info with anti-bot bypass options
-    // yt-dlp handles bot detection automatically, but we can add extra options
-    const info = await ytdlp.getInfoAsync(url, {
-      // yt-dlp options (passed as object keys, not --flags)
-      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-      referer: 'https://www.youtube.com/',
-      // Use Android client to bypass bot detection (more reliable)
-      // extractorArgs expects arrays of strings
-      extractorArgs: {
-        youtube: ['player_client=android']
-      },
-    });
+  const ytdlp = new YtDlp();
+  
+  // Try different player clients in order of reliability
+  const playerClients = ['android', 'ios', 'web'];
+  const maxRetries = playerClients.length;
+  
+  let lastError = null;
+  
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    try {
+      const playerClient = playerClients[attempt];
+      
+      // Use yt-dlp to get video info with anti-bot bypass options
+      const info = await ytdlp.getInfoAsync(url, {
+        // yt-dlp options (passed as object keys, not --flags)
+        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        referer: 'https://www.youtube.com/',
+        // Try different player clients
+        extractorArgs: {
+          youtube: [`player_client=${playerClient}`]
+        },
+        // Don't require cookies (works better on servers without browser access)
+        noCookies: true,
+        // Add small delays to mimic human behavior
+        sleepRequests: 1,
+        sleepInterval: 1,
+      });
     
     // Extract video details from yt-dlp format
     const videoDetails = {
@@ -161,15 +174,27 @@ async function getVideoInfo(url) {
       return (b.bitrate || 0) - (a.bitrate || 0);
     });
 
-    videoDetails.formats = {
-      video: videoFormats,
-      audio: audioFormats
-    };
+      videoDetails.formats = {
+        video: videoFormats,
+        audio: audioFormats
+      };
 
-    return videoDetails;
-  } catch (error) {
-    throw new Error(`Failed to get video info: ${error.message}`);
+      return videoDetails;
+    } catch (error) {
+      lastError = error;
+      // If it's a bot detection error and we have more clients to try, continue
+      if (error.message && error.message.includes('bot') && attempt < maxRetries - 1) {
+        // Wait a bit before retrying with different client
+        await new Promise(resolve => setTimeout(resolve, 1000 * (attempt + 1)));
+        continue;
+      }
+      // If it's not a bot error or we've exhausted all clients, throw
+      throw error;
+    }
   }
+  
+  // If we get here, all retries failed
+  throw new Error(`Failed to get video info after ${maxRetries} attempts: ${lastError?.message || 'Unknown error'}`);
 }
 
 /**
@@ -189,10 +214,14 @@ async function getDownloadStream(url, formatId) {
       // Anti-bot bypass options
       userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
       referer: 'https://www.youtube.com/',
-      // Use Android client to bypass bot detection (more reliable)
+      // Use Android client (most reliable for bypassing bot detection)
       extractorArgs: {
         youtube: ['player_client=android']
       },
+      // Don't require cookies
+      noCookies: true,
+      sleepRequests: 1,
+      sleepInterval: 1,
     });
 
     // Extract the download URL from the info
